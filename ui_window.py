@@ -2,15 +2,16 @@
 AI 浏览器助手 - PyQt5 主窗口
 """
 
-import tempfile
 import os
+import urllib.request
+import urllib.error
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextBrowser, QLineEdit, QPushButton, QApplication,
-    QStatusBar
+    QStatusBar, QMessageBox
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtGui import QFont, QTextCursor
 
 from agent import AgentThread
 import config
@@ -64,14 +65,48 @@ QStatusBar {
 """
 
 
+def check_llm_server():
+    """检查 llama-server 是否在运行"""
+    try:
+        url = config.LLM_BASE_URL.replace("/v1", "") + "/health"
+        req = urllib.request.Request(url, method="GET")
+        urllib.request.urlopen(req, timeout=3)
+        return True
+    except:
+        try:
+            # 尝试 /v1/models 端点
+            url = config.LLM_BASE_URL + "/models"
+            req = urllib.request.Request(url, method="GET")
+            urllib.request.urlopen(req, timeout=3)
+            return True
+        except:
+            return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.agent = AgentThread()
-        self._screenshot_files = []  # 临时截图文件列表
         self._init_ui()
         self._connect_signals()
         self.agent.start()
+        self._check_server_on_start()
+
+    def _check_server_on_start(self):
+        """启动时检查 AI 服务"""
+        if check_llm_server():
+            self._add_msg("system",
+                "AI 服务已连接 ✅ (llama-server 运行中)<br><br>"
+                "1. 点击「打开AI浏览器」启动浏览器<br>"
+                "2. 输入任务，AI 将自动操作浏览器<br>"
+                "3. 你可以实时看到浏览器的每一步操作"
+            )
+        else:
+            self._add_msg("error",
+                "未检测到 AI 服务！请先启动 llama-server<br>"
+                f"预期地址: {config.LLM_BASE_URL}<br><br>"
+                "启动后再点「打开AI浏览器」即可"
+            )
 
     def _init_ui(self):
         self.setWindowTitle("AI 浏览器助手")
@@ -137,19 +172,10 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("就绪 - 请先打开AI浏览器")
 
-        # ── 欢迎消息 ──
-        self._add_msg("system",
-            "欢迎使用 AI 浏览器助手！<br><br>"
-            "1. 点击「打开AI浏览器」启动浏览器<br>"
-            "2. 输入任务，AI 将自动操作浏览器<br>"
-            "3. 你可以实时看到浏览器的每一步操作"
-        )
-
     # ── 信号连接 ──
 
     def _connect_signals(self):
         self.agent.message.connect(self._add_msg)
-        self.agent.screenshot.connect(self._add_screenshot)
         self.agent.state_changed.connect(self._on_state_changed)
         self.agent.agent_done.connect(self._on_agent_done)
 
@@ -190,26 +216,6 @@ class MainWindow(QMainWindow):
         self.chat.setTextCursor(cursor)
         self.chat.ensureCursorVisible()
 
-    def _add_screenshot(self, data: bytes):
-        """在对话区嵌入截图"""
-        # 保存为临时文件
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir="/tmp")
-        tmp.write(data)
-        tmp.close()
-        self._screenshot_files.append(tmp.name)
-
-        cursor = self.chat.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(
-            f'<div style="margin:4px 0;">'
-            f'<span style="color:#6c7086;font-size:12px;">浏览器截图</span><br>'
-            f'<img src="file://{tmp.name}" width="520" '
-            f'style="border:1px solid #45475a;border-radius:6px;" />'
-            f'</div><br>'
-        )
-        self.chat.setTextCursor(cursor)
-        self.chat.ensureCursorVisible()
-
     # ── 按钮事件 ──
 
     def _on_toggle_browser(self):
@@ -221,7 +227,6 @@ class MainWindow(QMainWindow):
             self.agent.shutdown()
             self.agent = AgentThread()
             self.agent.message.connect(self._add_msg)
-            self.agent.screenshot.connect(self._add_screenshot)
             self.agent.state_changed.connect(self._on_state_changed)
             self.agent.agent_done.connect(self._on_agent_done)
             self.agent.start()
@@ -275,10 +280,4 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.agent.shutdown()
         self.agent.wait(3000)
-        # 清理临时截图文件
-        for f in self._screenshot_files:
-            try:
-                os.unlink(f)
-            except:
-                pass
         event.accept()

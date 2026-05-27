@@ -11,8 +11,6 @@ LLM_MODEL = "gemma-4"
 
 # --- 浏览器配置 ---
 BROWSER_HEADLESS = False          # False = 有头模式，你能看到浏览器窗口
-BROWSER_WIDTH = 1280
-BROWSER_HEIGHT = 720
 BROWSER_START_URL = "https://www.bing.com"  # 浏览器启动后打开的首页
 
 # --- Agent 配置 ---
