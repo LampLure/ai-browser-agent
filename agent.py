@@ -44,7 +44,7 @@ SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不�
 7. 不要点击搜索框下方的推荐词、分类标签、热搜等内容。
 8. 默认操作用户当前正在看的标签页。页面状态中会标注"[当前标签]"。
 9. 只有用户明确指定"在第X个标签页操作"时才用switch_tab切换。
-10. 当文字描述不够、需要看页面布局/图片/验证码时，用screenshot截图观察。每次只能截1张。"""
+10. 截图(screenshot)是最后手段！只有当页面元素列表的文字信息不足以完成任务时才截图（例如：需要看图片/验证码/复杂布局、元素无法定位等）。如果文字信息已经足够，绝对不要截图！每次只能截1张。"""
 
 # 总结页面内容时的专用提示词
 SUMMARIZE_PROMPT = """用户要求总结当前页面内容。请阅读以下页面正文，用中文简洁总结要点。直接输出总结文本，不需要JSON。"""
@@ -68,6 +68,7 @@ class AgentThread(QThread):
         self._running = True
         self._stop_task_flag = False
         self._stop_event = threading.Event()
+        self._last_active_page = None  # 追踪最近确认的活跃标签页
 
     # ── 外部调用接口 ──
 
@@ -115,11 +116,26 @@ class AgentThread(QThread):
                     )
                     context = browser.new_context(no_viewport=True)
 
+                    # 注入 visibility 追踪脚本到所有新页面
+                    context.add_init_script("""
+                        document.addEventListener('visibilitychange', () => {
+                            document.documentElement.setAttribute(
+                                'data-ai-visible',
+                                document.visibilityState
+                            );
+                        });
+                        document.documentElement.setAttribute(
+                            'data-ai-visible',
+                            document.visibilityState
+                        );
+                    """)
+
                     # 监听新标签页打开
                     context.on("page", self._on_new_page)
 
                     page = context.new_page()
                     page.goto(config.BROWSER_START_URL, timeout=15000)
+                    self._last_active_page = page
                     self.message.emit("system", "浏览器已启动！现在可以输入任务了。")
                     self.state_changed.emit("idle")
                 except Exception as e:
@@ -143,16 +159,21 @@ class AgentThread(QThread):
                     self.agent_done.emit()
                     continue
 
-                # 提示用户 AI 识别到的当前标签页
+                # 提示用户 AI 识别到的当前标签页（含调试信息）
                 try:
                     pages = context.pages
                     if len(pages) > 1:
+                        # 显示所有标签页的可见性状态
+                        vis_info = []
                         for i, p in enumerate(pages):
-                            if p is active_page:
-                                tab_title = p.title() or "空白页"
-                                self.message.emit("system",
-                                    f"检测到当前标签: 标签{i} - {tab_title[:50]}")
-                                break
+                            try:
+                                vis = p.evaluate("document.visibilityState")
+                            except:
+                                vis = "?"
+                            is_current = " ←当前" if p is active_page else ""
+                            vis_info.append(f"  标签{i}: vis={vis}{is_current}")
+                        self.message.emit("system",
+                            "标签页检测:\n" + "\n".join(vis_info))
                 except:
                     pass
 
@@ -189,45 +210,88 @@ class AgentThread(QThread):
     def _get_active_page(self, context):
         """
         获取用户当前正在看的标签页。
-        优先使用 document.visibilityState（不依赖浏览器窗口是否获得系统焦点），
-        其次用 document.hasFocus()，最后回退到最后一个标签页。
+        多重检测策略，从最可靠到兜底：
+        1. document.visibilityState + data-ai-visible 属性
+        2. document.hasFocus()（浏览器窗口有系统焦点时）
+        3. 记录的最近活跃页面 _last_active_page
+        4. 最后一个标签页
 
-        注意：document.hasFocus() 要求浏览器窗口本身有系统焦点，
+        关键：document.hasFocus() 要求浏览器窗口本身有系统焦点，
         当用户在 PyQt5 窗口输入时浏览器没有焦点，所有标签页都返回 false。
-        而 document.visibilityState === "visible" 只需要该标签页是浏览器
-        中当前显示的那个，不受系统焦点影响。
+        document.visibilityState === "visible" 只需要该标签页是浏览器中
+        当前显示的那个，不受系统焦点影响。我们还通过 add_init_script
+        注入了 visibilitychange 监听器，将状态同步到 data-ai-visible 属性，
+        作为双重保障。
         """
         try:
             pages = context.pages
             if not pages:
                 return None
 
-            # 优先1: 用 visibilityState 找当前显示的标签页
-            # 这个属性在浏览器窗口没有系统焦点时仍然正确返回 "visible"
-            for page in pages:
+            # 只有一个标签页，直接返回
+            if len(pages) == 1:
+                self._last_active_page = pages[0]
+                return pages[0]
+
+            # 收集每个标签页的可见性信息
+            page_vis = []
+            for i, page in enumerate(pages):
                 try:
-                    visibility = page.evaluate("document.visibilityState")
-                    if visibility == "visible":
+                    # 方法1: 直接检查 visibilityState
+                    vis = page.evaluate("document.visibilityState")
+                    # 方法2: 检查注入的 data-ai-visible 属性（双重保障）
+                    attr_vis = page.evaluate(
+                        "document.documentElement.getAttribute('data-ai-visible') || 'unknown'"
+                    )
+                    # 如果任一方法返回 visible，就认为该标签页是可见的
+                    is_visible = (vis == "visible") or (attr_vis == "visible")
+                    page_vis.append((i, page, vis, attr_vis, is_visible))
+                except:
+                    page_vis.append((i, page, "error", "error", False))
+
+            # 策略1: 找到唯一 visible 的标签页
+            visible_pages = [p for p in page_vis if p[4]]
+            if len(visible_pages) == 1:
+                self._last_active_page = visible_pages[0][1]
+                return visible_pages[0][1]
+            elif len(visible_pages) > 1:
+                # 多个 visible，用 hasFocus 区分
+                for i, page, vis, attr_vis, _ in visible_pages:
+                    try:
+                        if page.evaluate("document.hasFocus()"):
+                            self._last_active_page = page
+                            return page
+                    except:
+                        continue
+                # 都没焦点，返回 visible 列表中的最后一个
+                self._last_active_page = visible_pages[-1][1]
+                return visible_pages[-1][1]
+
+            # 策略2: 用 hasFocus 找有焦点的标签页
+            for i, page, vis, attr_vis, _ in page_vis:
+                try:
+                    if page.evaluate("document.hasFocus()"):
+                        self._last_active_page = page
                         return page
                 except:
                     continue
 
-            # 优先2: 用 hasFocus 找有焦点的标签页（浏览器窗口有系统焦点时）
-            for page in pages:
+            # 策略3: 使用记录的最近活跃页面
+            if self._last_active_page:
                 try:
-                    has_focus = page.evaluate("document.hasFocus()")
-                    if has_focus:
-                        return page
+                    if self._last_active_page in pages:
+                        return self._last_active_page
                 except:
-                    continue
+                    pass
 
-            # 回退: 用最后一个标签页（通常是最新打开的）
+            # 策略4: 兜底，最后一个标签页
+            self._last_active_page = pages[-1]
             return pages[-1]
         except:
             return None
 
     def _get_tabs_info(self, context) -> str:
-        """获取所有标签页信息，标注当前活跃的"""
+        """获取所有标签页信息，标注当前活跃的，同时显示可见性状态"""
         try:
             pages = context.pages
             if not pages:
@@ -241,9 +305,15 @@ class AgentThread(QThread):
                     title = page.title() or "空白页"
                     url = page.url or ""
                     is_current = " [当前标签]" if page is active_page else ""
-                    lines.append(f"  标签{i}: {title[:40]} - {url[:60]}{is_current}")
+                    # 获取可见性状态用于调试
+                    try:
+                        vis = page.evaluate("document.visibilityState")
+                    except:
+                        vis = "?"
+                    vis_mark = "👁" if vis == "visible" else "🔸"
+                    lines.append(f"  {vis_mark} 标签{i}: {title[:40]} - {url[:60]}{is_current}")
                 except:
-                    lines.append(f"  标签{i}: (无法读取)")
+                    lines.append(f"  🔸 标签{i}: (无法读取)")
 
             return "打开的标签页:\n" + "\n".join(lines)
         except:
@@ -301,6 +371,7 @@ class AgentThread(QThread):
                     if 0 <= tab_idx < len(pages):
                         page = pages[tab_idx]
                         page.bring_to_front()
+                        self._last_active_page = page  # 更新追踪
                         self.message.emit("ai", f"已切换到标签{tab_idx}: {page.title()[:40]}")
                         if self._interruptible_sleep(0.5):
                             return
@@ -350,6 +421,7 @@ class AgentThread(QThread):
                 new_active = self._get_active_page(context)
                 if new_active and new_active is not page:
                     page = new_active
+                    self._last_active_page = page  # 更新追踪
                     self.message.emit("system", f"检测到切换标签页: {page.title()[:40]}")
 
                 tabs_info = self._get_tabs_info(context)
