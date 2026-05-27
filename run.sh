@@ -12,4 +12,8 @@ fi
 
 # 激活虚拟环境并运行
 source .venv/bin/activate
+
+# 本地连接不走代理，避免 httpx 报 socks 代理错误
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+
 python3 main.py

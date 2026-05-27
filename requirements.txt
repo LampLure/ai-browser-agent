@@ -1,3 +1,4 @@
 PyQt5>=5.15
 playwright>=1.40
 openai>=1.0
+httpx[socks]>=0.27
