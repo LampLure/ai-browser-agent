@@ -15,27 +15,32 @@ import config
 
 
 # ============================================================
-# 系统提示词 - 专为小模型设计，尽量简洁
+# 系统提示词 - 严格约束 + 高自由度
 # ============================================================
-SYSTEM_PROMPT = """你是浏览器操作AI。根据页面元素列表执行操作。
+SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不多做一步。
 
-## 操作格式（每次只输出一个JSON）
+## 可用操作（每次只输出一个JSON）
 导航到网站: {"action":"goto","url":"https://example.com"}
-在输入框输入文字: {"action":"type","idx":1,"text":"搜索词","enter":true}
+在输入框输入: {"action":"type","idx":1,"text":"内容","enter":true}
 点击元素: {"action":"click","idx":0}
 按键: {"action":"press","key":"Enter"}
-滚动: {"action":"scroll","direction":"down"}
-等待: {"action":"wait","seconds":2}
-完成: {"action":"done","message":"结果说明"}
-需要更多信息: {"action":"ask","message":"问题"}
+滚动页面: {"action":"scroll","direction":"down"}
+等待加载: {"action":"wait","seconds":2}
+总结页面内容: {"action":"summarize"}
+完成任务: {"action":"done","message":"结果"}
+询问用户: {"action":"ask","message":"问题"}
 
-## 关键规则
-1. 用户说"前往/打开/去 xxx网站"时，必须用goto导航，不要在当前页面输入框输入网址！
-2. type操作的enter=true会自动按回车提交，搜索时务必加上！
-3. 每次只输出一个操作，不要一次输出多个。
-4. idx 从页面元素列表中获取。
+## 铁律（必须遵守）
+1. 严格只做用户要求的操作！不要自作主张多走任何一步。
+2. 用户说"前往/打开xxx网站"→ 只用goto导航，完成后立即done。不要在搜索框输入网址！
+3. 用户说"搜索xxx"→ 输入搜索词+回车，然后立即done。不要点击搜索建议、推荐分类、热搜标签等！
+4. 用户说"总结/读一下"→ 用summarize，返回页面正文内容。
+5. 只有用户明确说"找一下/看看有没有/探索"时，才可以点击链接浏览。
+6. type的enter=true自动按回车，搜索时必须加。
+7. 不要点击搜索框下方的推荐词、分类标签、热搜等内容。"""
 
-先简短思考1句话，再输出JSON，用```json和```包裹。"""
+# 总结页面内容时的专用提示词
+SUMMARIZE_PROMPT = """用户要求总结当前页面内容。请阅读以下页面正文，用中文简洁总结要点。直接输出总结文本，不需要JSON。"""
 
 
 class AgentThread(QThread):
@@ -54,7 +59,7 @@ class AgentThread(QThread):
         self._queue = queue.Queue()
         self._running = True
         self._stop_task_flag = False
-        self._stop_event = threading.Event()  # 用于立即中断 LLM 等待
+        self._stop_event = threading.Event()
 
     # ── 外部调用接口（主线程调用） ──
 
@@ -69,7 +74,7 @@ class AgentThread(QThread):
     def stop_task(self):
         """立即停止当前任务"""
         self._stop_task_flag = True
-        self._stop_event.set()  # 立即唤醒所有等待
+        self._stop_event.set()
 
     def shutdown(self):
         """关闭整个 Agent"""
@@ -90,7 +95,6 @@ class AgentThread(QThread):
         history = []
 
         while self._running:
-            # 取命令（带超时，避免死锁）
             try:
                 cmd = self._queue.get(timeout=0.1)
             except queue.Empty:
@@ -103,9 +107,8 @@ class AgentThread(QThread):
                 try:
                     browser = pw.chromium.launch(
                         headless=config.BROWSER_HEADLESS,
-                        args=["--start-maximized"]  # 最大化窗口
+                        args=["--start-maximized"]
                     )
-                    # no_viewport=True 让页面内容自动填满整个浏览器窗口
                     context = browser.new_context(no_viewport=True)
                     page = context.new_page()
                     page.goto(config.BROWSER_START_URL, timeout=15000)
@@ -124,7 +127,7 @@ class AgentThread(QThread):
                 self._stop_task_flag = False
                 self._stop_event.clear()
                 self._run_agent_loop(page, llm, history, cmd["task"])
-                history.clear()  # 每次任务清空历史
+                history.clear()
                 if self._stop_task_flag:
                     self.message.emit("ai", "任务已停止")
                 self.state_changed.emit("idle")
@@ -134,7 +137,6 @@ class AgentThread(QThread):
             elif cmd_type == "shutdown":
                 break
 
-        # 清理
         if browser:
             try:
                 browser.close()
@@ -146,26 +148,25 @@ class AgentThread(QThread):
     # ── Agent 主循环 ──
 
     def _run_agent_loop(self, page, llm, history, task):
-        """核心 Agent 循环：获取页面状态 → 发给 LLM → 解析动作 → 执行"""
+        """核心 Agent 循环"""
         self.message.emit("ai", f"开始执行: {task}")
 
-        # 首轮 prompt
-        first_prompt = f"用户任务: {task}\n\n{self._get_page_state(page)}"
+        # 检测是否是总结/阅读类任务 → 走特殊路径
+        if self._is_summarize_task(task):
+            self._do_summarize(page, llm, task)
+            return
 
-        # 构建历史
+        first_prompt = f"用户任务: {task}\n\n{self._get_page_state(page)}"
         history.append({"role": "user", "content": first_prompt})
 
         for step in range(config.MAX_STEPS):
-            # ── 立即检查停止标志 ──
             if not self._running or self._stop_task_flag:
                 return
 
             try:
-                # 1. 调用 LLM（带中断检测）
                 self.message.emit("ai", "思考中...")
                 response = self._call_llm_interruptible(llm, history)
                 if response is None:
-                    # 被中断
                     return
                 if not response:
                     self.message.emit("error", "LLM 返回为空，请检查 llama-server 是否运行")
@@ -173,12 +174,9 @@ class AgentThread(QThread):
 
                 history.append({"role": "assistant", "content": response})
 
-                # 2. 解析动作
                 action = self._parse_action(response)
                 if action is None:
-                    # 没解析出 JSON，把 AI 的文本回复显示出来
                     self.message.emit("ai", response[:500])
-                    # 再问一次
                     if self._stop_task_flag:
                         return
                     history.append({"role": "user", "content": f"请用JSON格式输出操作。当前页面状态:\n{self._get_page_state(page)}"})
@@ -186,25 +184,27 @@ class AgentThread(QThread):
 
                 action_type = action.get("action", "")
 
-                # 3. 处理终止类动作
+                # summarize 动作：提取正文并总结
+                if action_type == "summarize":
+                    self._do_summarize(page, llm, "总结当前页面内容")
+                    return
+
+                # 终止类动作
                 if action_type in ("done", "ask"):
                     msg = action.get("message", "操作完成")
                     icon = "✅" if action_type == "done" else "❓"
                     self.message.emit("ai", f"{icon} {msg}")
                     return
 
-                # 4. 执行动作
+                # 执行动作
                 self._execute_action(page, action)
 
-                # 5. 可中断等待（让页面加载）
                 if self._interruptible_sleep(config.ACTION_DELAY):
                     return
 
-                # 6. 把新页面状态加入对话
                 new_state = self._get_page_state(page)
                 history.append({"role": "user", "content": f"操作完成。当前页面状态:\n{new_state}"})
 
-                # 7. 控制历史长度（防止超上下文）
                 if len(history) > 16:
                     history[:] = history[-12:]
 
@@ -215,6 +215,96 @@ class AgentThread(QThread):
                     return
         else:
             self.message.emit("ai", f"已达到最大步数({config.MAX_STEPS})，任务可能未完成")
+
+    # ── 判断是否总结类任务 ──
+
+    def _is_summarize_task(self, task: str) -> bool:
+        """检测用户任务是否为总结/阅读类"""
+        keywords = ["总结", "读一下", "看看内容", "内容是什么", "说了什么",
+                     "阅读", "读读", "概括", "摘要", "总结一下",
+                     "summarize", "read", "内容"]
+        task_lower = task.lower()
+        return any(kw in task_lower for kw in keywords)
+
+    # ── 总结页面内容 ──
+
+    def _do_summarize(self, page, llm, task):
+        """提取页面正文并让 LLM 总结"""
+        self.message.emit("ai", "正在读取页面内容...")
+
+        page_text = self._get_page_text(page)
+        if not page_text or len(page_text.strip()) < 20:
+            self.message.emit("ai", "✅ 当前页面没有可读取的正文内容")
+            return
+
+        # 截取正文，防止超出上下文
+        max_chars = 6000
+        if len(page_text) > max_chars:
+            page_text = page_text[:max_chars] + "\n...(内容过长，已截断)"
+
+        prompt = f"{SUMMARIZE_PROMPT}\n\n页面标题: {page.title()}\nURL: {page.url}\n\n页面正文:\n{page_text}"
+
+        self.message.emit("ai", "正在总结...")
+
+        result = [None]
+        error = [None]
+
+        def _worker():
+            try:
+                resp = llm.chat.completions.create(
+                    model=config.LLM_MODEL,
+                    messages=[
+                        {"role": "system", "content": SUMMARIZE_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=800,
+                    temperature=0.3,
+                )
+                result[0] = resp.choices[0].message.content
+            except Exception as e:
+                error[0] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        while t.is_alive():
+            if self._stop_task_flag or not self._running:
+                return
+            t.join(timeout=0.2)
+
+        if error[0]:
+            self.message.emit("error", f"总结失败: {error[0]}")
+            return
+
+        if result[0]:
+            self.message.emit("ai", f"✅ {result[0]}")
+        else:
+            self.message.emit("ai", "✅ 无法总结该页面")
+
+    # ── 页面正文提取 ──
+
+    def _get_page_text(self, page) -> str:
+        """提取页面正文文本（去除导航、广告等无关内容）"""
+        try:
+            return page.evaluate("""() => {
+                // 尝试提取 main/article 正文区域
+                const selectors = ['article', 'main', '[role="main"]', '.content', '.article', '.post'];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.textContent.trim().length > 100) {
+                        return el.textContent.trim().substring(0, 8000);
+                    }
+                }
+                // 回退：提取 body，但排除 script/style/nav/footer/header
+                const body = document.body.cloneNode(true);
+                const removeTags = ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript'];
+                removeTags.forEach(tag => {
+                    body.querySelectorAll(tag).forEach(el => el.remove());
+                });
+                return body.textContent.trim().substring(0, 8000);
+            }""")
+        except Exception as e:
+            return f"内容提取失败: {e}"
 
     # ── 可中断的等待 ──
 
@@ -244,7 +334,6 @@ class AgentThread(QThread):
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-        # 等待 LLM 返回或停止信号
         while t.is_alive():
             if self._stop_task_flag or not self._running:
                 return None
@@ -261,7 +350,6 @@ class AgentThread(QThread):
     def _get_page_state(self, page) -> str:
         """提取当前页面的可交互元素列表"""
         try:
-            # 注入 JS：给每个交互元素加 data-ai-idx 属性，然后提取信息
             page.evaluate("""() => {
                 const els = document.querySelectorAll(
                     'a, button, input, textarea, select, [role="button"], [onclick], [tabindex]:not([tabindex="-1"])'
@@ -316,7 +404,6 @@ class AgentThread(QThread):
 
     def _parse_action(self, response: str):
         """从 LLM 回复中解析 JSON 动作"""
-        # 尝试1: ```json ... ``` 代码块
         m = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
         if m:
             try:
@@ -324,7 +411,6 @@ class AgentThread(QThread):
             except json.JSONDecodeError:
                 pass
 
-        # 尝试2: ``` ... ``` 代码块（没有 json 标记）
         m = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
         if m:
             try:
@@ -332,7 +418,6 @@ class AgentThread(QThread):
             except json.JSONDecodeError:
                 pass
 
-        # 尝试3: 直接找 JSON 对象
         m = re.search(r'\{[^{}]*\}', response, re.DOTALL)
         if m:
             try:
