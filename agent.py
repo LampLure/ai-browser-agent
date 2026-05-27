@@ -10,6 +10,7 @@ import re
 import time
 import traceback
 import threading
+import base64
 from PyQt5.QtCore import QThread, pyqtSignal
 
 import config
@@ -27,6 +28,7 @@ SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不�
 按键: {"action":"press","key":"Enter"}
 滚动页面: {"action":"scroll","direction":"down"}
 等待加载: {"action":"wait","seconds":2}
+截图观察: {"action":"screenshot","question":"想了解什么"}
 总结页面内容: {"action":"summarize"}
 切换标签页: {"action":"switch_tab","tab":0}
 完成任务: {"action":"done","message":"结果"}
@@ -41,7 +43,8 @@ SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不�
 6. type的enter=true自动按回车，搜索时必须加。
 7. 不要点击搜索框下方的推荐词、分类标签、热搜等内容。
 8. 默认操作用户当前正在看的标签页。页面状态中会标注"[当前标签]"。
-9. 只有用户明确指定"在第X个标签页操作"时才用switch_tab切换。"""
+9. 只有用户明确指定"在第X个标签页操作"时才用switch_tab切换。
+10. 当文字描述不够、需要看页面布局/图片/验证码时，用screenshot截图观察。每次只能截1张。"""
 
 # 总结页面内容时的专用提示词
 SUMMARIZE_PROMPT = """用户要求总结当前页面内容。请阅读以下页面正文，用中文简洁总结要点。直接输出总结文本，不需要JSON。"""
@@ -286,6 +289,21 @@ class AgentThread(QThread):
                     self._do_summarize(active, llm, "总结当前页面内容")
                     return
 
+                # screenshot 动作：截图发给视觉模型理解
+                if action_type == "screenshot":
+                    question = action.get("question", "请描述当前页面内容")
+                    vision_result = self._do_screenshot_vision(page, llm, question)
+                    if vision_result:
+                        self.message.emit("ai", f"👀 截图观察结果: {vision_result[:500]}")
+                        # 把观察结果加入对话，让 AI 继续决策
+                        tabs_info = self._get_tabs_info(context)
+                        page_state = self._get_page_state(page)
+                        history.append({"role": "user",
+                            "content": f"截图观察结果: {vision_result}\n\n{tabs_info}\n\n{page_state}"})
+                    else:
+                        self.message.emit("ai", "截图观察失败，继续基于文字信息操作")
+                    continue
+
                 # 终止类动作
                 if action_type in ("done", "ask"):
                     msg = action.get("message", "操作完成")
@@ -379,6 +397,74 @@ class AgentThread(QThread):
             self.message.emit("ai", f"✅ {result[0]}")
         else:
             self.message.emit("ai", "✅ 无法总结该页面")
+
+    # ── 截图视觉理解 ──
+
+    def _do_screenshot_vision(self, page, llm, question: str) -> str:
+        """
+        截取当前页面截图，发送给 LLM 视觉模型理解。
+        每次只截1张，返回视觉理解结果。
+        """
+        self.message.emit("ai", "📷 正在截图...")
+
+        try:
+            # 截图并压缩为 JPEG 以减少 token 消耗
+            screenshot_bytes = page.screenshot(type="jpeg", quality=75)
+            b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+            self.message.emit("ai", "👀 正在分析截图...")
+
+            # 构造多模态消息（OpenAI 兼容格式）
+            vision_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"你正在操作浏览器。用户问题: {question}\n\n请根据截图简要描述页面内容，重点关注：1)页面显示了什么 2)有哪些可操作元素 3)当前状态。用中文回答，简洁为主。"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}"
+                            }
+                        }
+                    ]
+                }
+            ]
+
+            result = [None]
+            error = [None]
+
+            def _vision_worker():
+                try:
+                    resp = llm.chat.completions.create(
+                        model=config.LLM_MODEL,
+                        messages=vision_messages,
+                        max_tokens=500,
+                        temperature=0.3,
+                    )
+                    result[0] = resp.choices[0].message.content
+                except Exception as e:
+                    error[0] = e
+
+            t = threading.Thread(target=_vision_worker, daemon=True)
+            t.start()
+
+            while t.is_alive():
+                if self._stop_task_flag or not self._running:
+                    return ""
+                t.join(timeout=0.5)
+
+            if error[0]:
+                self.message.emit("error", f"视觉分析失败: {error[0]}")
+                return ""
+
+            return result[0] or ""
+
+        except Exception as e:
+            self.message.emit("error", f"截图失败: {e}")
+            return ""
 
     # ── 页面正文提取 ──
 
