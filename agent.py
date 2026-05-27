@@ -20,16 +20,21 @@ import config
 SYSTEM_PROMPT = """你是浏览器操作AI。根据页面元素列表执行操作。
 
 ## 操作格式（每次只输出一个JSON）
-点击: {"action":"click","idx":0}
-输入: {"action":"type","idx":1,"text":"搜索词"}
+导航到网站: {"action":"goto","url":"https://example.com"}
+在输入框输入文字: {"action":"type","idx":1,"text":"搜索词","enter":true}
+点击元素: {"action":"click","idx":0}
 按键: {"action":"press","key":"Enter"}
 滚动: {"action":"scroll","direction":"down"}
-导航: {"action":"goto","url":"https://..."}
 等待: {"action":"wait","seconds":2}
 完成: {"action":"done","message":"结果说明"}
-提问: {"action":"ask","message":"问题"}
+需要更多信息: {"action":"ask","message":"问题"}
 
-idx 是元素编号，从页面元素列表中获取。
+## 关键规则
+1. 用户说"前往/打开/去 xxx网站"时，必须用goto导航，不要在当前页面输入框输入网址！
+2. type操作的enter=true会自动按回车提交，搜索时务必加上！
+3. 每次只输出一个操作，不要一次输出多个。
+4. idx 从页面元素列表中获取。
+
 先简短思考1句话，再输出JSON，用```json和```包裹。"""
 
 
@@ -356,9 +361,13 @@ class AgentThread(QThread):
             elif atype == "type":
                 idx = action.get("idx", 0)
                 text = action.get("text", "")
+                do_enter = action.get("enter", False)
                 selector = f'[data-ai-idx="{idx}"]'
-                self.message.emit("ai", f'在 [{idx}] 输入 "{text}"')
+                enter_hint = " + Enter" if do_enter else ""
+                self.message.emit("ai", f'在 [{idx}] 输入 "{text}"{enter_hint}')
                 page.fill(selector, text, timeout=5000)
+                if do_enter:
+                    page.keyboard.press("Enter")
 
             elif atype == "press":
                 key = action.get("key", "Enter")
