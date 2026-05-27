@@ -9,8 +9,8 @@ from PyQt5.QtWidgets import (
     QTextBrowser, QLineEdit, QPushButton, QApplication,
     QStatusBar
 )
-from PyQt5.QtCore import Qt, QTextCursor
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 from agent import AgentThread
 import config
