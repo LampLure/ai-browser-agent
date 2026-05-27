@@ -74,7 +74,6 @@ def check_llm_server():
         return True
     except:
         try:
-            # 尝试 /v1/models 端点
             url = config.LLM_BASE_URL + "/models"
             req = urllib.request.Request(url, method="GET")
             urllib.request.urlopen(req, timeout=3)
@@ -86,6 +85,7 @@ def check_llm_server():
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._pinned = False  # 置顶状态
         self.agent = AgentThread()
         self._init_ui()
         self._connect_signals()
@@ -99,7 +99,7 @@ class MainWindow(QMainWindow):
                 "AI 服务已连接 ✅ (llama-server 运行中)<br><br>"
                 "1. 点击「打开AI浏览器」启动浏览器<br>"
                 "2. 输入任务，AI 将自动操作浏览器<br>"
-                "3. 你可以实时看到浏览器的每一步操作"
+                "3. AI 默认操作你正在看的标签页"
             )
         else:
             self._add_msg("error",
@@ -164,6 +164,14 @@ class MainWindow(QMainWindow):
         )
         self.stop_btn.clicked.connect(self._on_stop)
         btn_row.addWidget(self.stop_btn)
+
+        self.pin_btn = QPushButton("📌 置顶")
+        self.pin_btn.setStyleSheet(
+            "QPushButton{background:#585b70;color:#cdd6f4;}"
+            "QPushButton:hover{background:#6c7086;}"
+        )
+        self.pin_btn.clicked.connect(self._on_pin)
+        btn_row.addWidget(self.pin_btn)
 
         layout.addLayout(btn_row)
 
@@ -245,6 +253,28 @@ class MainWindow(QMainWindow):
     def _on_stop(self):
         self.agent.stop_task()
         self.stop_btn.setEnabled(False)
+
+    def _on_pin(self):
+        """切换窗口置顶"""
+        self._pinned = not self._pinned
+        if self._pinned:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+            self.pin_btn.setStyleSheet(
+                "QPushButton{background:#cba6f7;color:#1e1e2e;}"
+                "QPushButton:hover{background:#b4befe;}"
+            )
+            self.pin_btn.setText("📌 取消置顶")
+            self.status.showMessage("窗口已置顶")
+        else:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+            self.pin_btn.setStyleSheet(
+                "QPushButton{background:#585b70;color:#cdd6f4;}"
+                "QPushButton:hover{background:#6c7086;}"
+            )
+            self.pin_btn.setText("📌 置顶")
+            self.status.showMessage("已取消置顶")
+        # setWindowFlags 会导致窗口隐藏，需要重新 show
+        self.show()
 
     # ── Agent 状态回调 ──
 

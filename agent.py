@@ -1,6 +1,7 @@
 """
 AI 浏览器助手 - Agent 核心模块
 在独立 QThread 中运行 Playwright 浏览器 + LLM 推理循环
+支持多标签页感知，默认操作用户当前正在看的标签页
 """
 
 import queue
@@ -27,6 +28,7 @@ SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不�
 滚动页面: {"action":"scroll","direction":"down"}
 等待加载: {"action":"wait","seconds":2}
 总结页面内容: {"action":"summarize"}
+切换标签页: {"action":"switch_tab","tab":0}
 完成任务: {"action":"done","message":"结果"}
 询问用户: {"action":"ask","message":"问题"}
 
@@ -37,7 +39,9 @@ SYSTEM_PROMPT = """你是浏览器操作AI。严格按用户指令操作，不�
 4. 用户说"总结/读一下"→ 用summarize，返回页面正文内容。
 5. 只有用户明确说"找一下/看看有没有/探索"时，才可以点击链接浏览。
 6. type的enter=true自动按回车，搜索时必须加。
-7. 不要点击搜索框下方的推荐词、分类标签、热搜等内容。"""
+7. 不要点击搜索框下方的推荐词、分类标签、热搜等内容。
+8. 默认操作用户当前正在看的标签页。页面状态中会标注"[当前标签]"。
+9. 只有用户明确指定"在第X个标签页操作"时才用switch_tab切换。"""
 
 # 总结页面内容时的专用提示词
 SUMMARIZE_PROMPT = """用户要求总结当前页面内容。请阅读以下页面正文，用中文简洁总结要点。直接输出总结文本，不需要JSON。"""
@@ -47,12 +51,13 @@ class AgentThread(QThread):
     """
     Agent 工作线程 - 拥有 Playwright 和 LLM 实例
     通过命令队列接收指令，通过信号向 UI 报告状态
+    支持多标签页感知，默认操作用户正在看的标签页
     """
 
     # ── Qt 信号 ──
-    message = pyqtSignal(str, str)       # (role, text)  role: user/ai/system/error
+    message = pyqtSignal(str, str)       # (role, text)
     state_changed = pyqtSignal(str)      # "ready" / "busy" / "idle" / "closed"
-    agent_done = pyqtSignal()            # 单次任务完成
+    agent_done = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -61,23 +66,19 @@ class AgentThread(QThread):
         self._stop_task_flag = False
         self._stop_event = threading.Event()
 
-    # ── 外部调用接口（主线程调用） ──
+    # ── 外部调用接口 ──
 
     def launch_browser(self):
-        """请求启动浏览器"""
         self._queue.put({"type": "launch_browser"})
 
     def send_task(self, task: str):
-        """发送一个任务"""
         self._queue.put({"type": "task", "task": task})
 
     def stop_task(self):
-        """立即停止当前任务"""
         self._stop_task_flag = True
         self._stop_event.set()
 
     def shutdown(self):
-        """关闭整个 Agent"""
         self._running = False
         self._stop_event.set()
         self._queue.put({"type": "shutdown"})
@@ -90,7 +91,7 @@ class AgentThread(QThread):
 
         pw = sync_playwright().start()
         browser = None
-        page = None
+        context = None
         llm = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
         history = []
 
@@ -110,6 +111,10 @@ class AgentThread(QThread):
                         args=["--start-maximized"]
                     )
                     context = browser.new_context(no_viewport=True)
+
+                    # 监听新标签页打开
+                    context.on("page", self._on_new_page)
+
                     page = context.new_page()
                     page.goto(config.BROWSER_START_URL, timeout=15000)
                     self.message.emit("system", "浏览器已启动！现在可以输入任务了。")
@@ -120,13 +125,22 @@ class AgentThread(QThread):
 
             # ── 执行任务 ──
             elif cmd_type == "task":
-                if page is None:
+                if context is None:
                     self.message.emit("error", "请先打开浏览器")
                     continue
                 self.state_changed.emit("busy")
                 self._stop_task_flag = False
                 self._stop_event.clear()
-                self._run_agent_loop(page, llm, history, cmd["task"])
+
+                # 获取用户当前正在看的标签页
+                active_page = self._get_active_page(context)
+                if active_page is None:
+                    self.message.emit("error", "没有可用的标签页")
+                    self.state_changed.emit("idle")
+                    self.agent_done.emit()
+                    continue
+
+                self._run_agent_loop(active_page, context, llm, history, cmd["task"])
                 history.clear()
                 if self._stop_task_flag:
                     self.message.emit("ai", "任务已停止")
@@ -145,18 +159,80 @@ class AgentThread(QThread):
         pw.stop()
         self.state_changed.emit("closed")
 
+    # ── 标签页管理 ──
+
+    def _on_new_page(self, new_page):
+        """新标签页打开时的回调"""
+        try:
+            title = new_page.title() or "新标签页"
+            url = new_page.url or ""
+            self.message.emit("system", f"新标签页已打开: {title[:50]}")
+        except:
+            self.message.emit("system", "新标签页已打开")
+
+    def _get_active_page(self, context):
+        """
+        获取用户当前正在看的标签页。
+        策略：遍历所有标签页，找到 document.hasFocus() 为 true 的。
+        如果都找不到（用户可能焦点在别的应用），用最后一个标签页。
+        """
+        try:
+            pages = context.pages
+            if not pages:
+                return None
+
+            for page in pages:
+                try:
+                    has_focus = page.evaluate("document.hasFocus()")
+                    if has_focus:
+                        return page
+                except:
+                    continue
+
+            # 回退：用最后一个标签页（通常是最新打开的）
+            return pages[-1]
+        except:
+            return None
+
+    def _get_tabs_info(self, context) -> str:
+        """获取所有标签页信息，标注当前活跃的"""
+        try:
+            pages = context.pages
+            if not pages:
+                return "标签页: 无"
+
+            lines = []
+            active_page = self._get_active_page(context)
+
+            for i, page in enumerate(pages):
+                try:
+                    title = page.title() or "空白页"
+                    url = page.url or ""
+                    is_current = " [当前标签]" if page is active_page else ""
+                    lines.append(f"  标签{i}: {title[:40]} - {url[:60]}{is_current}")
+                except:
+                    lines.append(f"  标签{i}: (无法读取)")
+
+            return "打开的标签页:\n" + "\n".join(lines)
+        except:
+            return "标签页信息获取失败"
+
     # ── Agent 主循环 ──
 
-    def _run_agent_loop(self, page, llm, history, task):
+    def _run_agent_loop(self, page, context, llm, history, task):
         """核心 Agent 循环"""
         self.message.emit("ai", f"开始执行: {task}")
 
-        # 检测是否是总结/阅读类任务 → 走特殊路径
+        # 检测是否是总结/阅读类任务
         if self._is_summarize_task(task):
-            self._do_summarize(page, llm, task)
+            active = self._get_active_page(context) or page
+            self._do_summarize(active, llm, task)
             return
 
-        first_prompt = f"用户任务: {task}\n\n{self._get_page_state(page)}"
+        # 首轮 prompt：包含标签页信息 + 当前页面元素
+        tabs_info = self._get_tabs_info(context)
+        page_state = self._get_page_state(page)
+        first_prompt = f"用户任务: {task}\n\n{tabs_info}\n\n{page_state}"
         history.append({"role": "user", "content": first_prompt})
 
         for step in range(config.MAX_STEPS):
@@ -179,14 +255,35 @@ class AgentThread(QThread):
                     self.message.emit("ai", response[:500])
                     if self._stop_task_flag:
                         return
-                    history.append({"role": "user", "content": f"请用JSON格式输出操作。当前页面状态:\n{self._get_page_state(page)}"})
+                    tabs_info = self._get_tabs_info(context)
+                    page_state = self._get_page_state(page)
+                    history.append({"role": "user", "content": f"请用JSON格式输出操作。\n\n{tabs_info}\n\n{page_state}"})
                     continue
 
                 action_type = action.get("action", "")
 
-                # summarize 动作：提取正文并总结
+                # 切换标签页
+                if action_type == "switch_tab":
+                    tab_idx = int(action.get("tab", 0))
+                    pages = context.pages
+                    if 0 <= tab_idx < len(pages):
+                        page = pages[tab_idx]
+                        page.bring_to_front()
+                        self.message.emit("ai", f"已切换到标签{tab_idx}: {page.title()[:40]}")
+                        if self._interruptible_sleep(0.5):
+                            return
+                    else:
+                        self.message.emit("error", f"标签页 {tab_idx} 不存在，共 {len(pages)} 个标签")
+                    # 切换后继续循环让 AI 看新页面
+                    tabs_info = self._get_tabs_info(context)
+                    page_state = self._get_page_state(page)
+                    history.append({"role": "user", "content": f"已切换标签页。\n\n{tabs_info}\n\n{page_state}"})
+                    continue
+
+                # summarize 动作
                 if action_type == "summarize":
-                    self._do_summarize(page, llm, "总结当前页面内容")
+                    active = self._get_active_page(context) or page
+                    self._do_summarize(active, llm, "总结当前页面内容")
                     return
 
                 # 终止类动作
@@ -202,8 +299,15 @@ class AgentThread(QThread):
                 if self._interruptible_sleep(config.ACTION_DELAY):
                     return
 
-                new_state = self._get_page_state(page)
-                history.append({"role": "user", "content": f"操作完成。当前页面状态:\n{new_state}"})
+                # 每步操作后重新检测活跃标签页（用户可能手动切了标签）
+                new_active = self._get_active_page(context)
+                if new_active and new_active is not page:
+                    page = new_active
+                    self.message.emit("system", f"检测到切换标签页: {page.title()[:40]}")
+
+                tabs_info = self._get_tabs_info(context)
+                page_state = self._get_page_state(page)
+                history.append({"role": "user", "content": f"操作完成。\n\n{tabs_info}\n\n{page_state}"})
 
                 if len(history) > 16:
                     history[:] = history[-12:]
@@ -219,17 +323,14 @@ class AgentThread(QThread):
     # ── 判断是否总结类任务 ──
 
     def _is_summarize_task(self, task: str) -> bool:
-        """检测用户任务是否为总结/阅读类"""
         keywords = ["总结", "读一下", "看看内容", "内容是什么", "说了什么",
                      "阅读", "读读", "概括", "摘要", "总结一下",
                      "summarize", "read", "内容"]
-        task_lower = task.lower()
-        return any(kw in task_lower for kw in keywords)
+        return any(kw in task.lower() for kw in keywords)
 
     # ── 总结页面内容 ──
 
     def _do_summarize(self, page, llm, task):
-        """提取页面正文并让 LLM 总结"""
         self.message.emit("ai", "正在读取页面内容...")
 
         page_text = self._get_page_text(page)
@@ -237,13 +338,11 @@ class AgentThread(QThread):
             self.message.emit("ai", "✅ 当前页面没有可读取的正文内容")
             return
 
-        # 截取正文，防止超出上下文
         max_chars = 6000
         if len(page_text) > max_chars:
             page_text = page_text[:max_chars] + "\n...(内容过长，已截断)"
 
         prompt = f"{SUMMARIZE_PROMPT}\n\n页面标题: {page.title()}\nURL: {page.url}\n\n页面正文:\n{page_text}"
-
         self.message.emit("ai", "正在总结...")
 
         result = [None]
@@ -284,10 +383,8 @@ class AgentThread(QThread):
     # ── 页面正文提取 ──
 
     def _get_page_text(self, page) -> str:
-        """提取页面正文文本（去除导航、广告等无关内容）"""
         try:
             return page.evaluate("""() => {
-                // 尝试提取 main/article 正文区域
                 const selectors = ['article', 'main', '[role="main"]', '.content', '.article', '.post'];
                 for (const sel of selectors) {
                     const el = document.querySelector(sel);
@@ -295,7 +392,6 @@ class AgentThread(QThread):
                         return el.textContent.trim().substring(0, 8000);
                     }
                 }
-                // 回退：提取 body，但排除 script/style/nav/footer/header
                 const body = document.body.cloneNode(true);
                 const removeTags = ['script', 'style', 'nav', 'footer', 'header', 'aside', 'noscript'];
                 removeTags.forEach(tag => {
@@ -309,13 +405,11 @@ class AgentThread(QThread):
     # ── 可中断的等待 ──
 
     def _interruptible_sleep(self, seconds):
-        """可中断的 sleep，返回 True 表示被停止"""
         return self._stop_event.wait(timeout=seconds)
 
     # ── 可中断的 LLM 调用 ──
 
     def _call_llm_interruptible(self, llm, history):
-        """在子线程中调用 LLM，主线程可中断"""
         result = [None]
         error = [None]
 
@@ -348,7 +442,6 @@ class AgentThread(QThread):
     # ── 页面状态提取 ──
 
     def _get_page_state(self, page) -> str:
-        """提取当前页面的可交互元素列表"""
         try:
             page.evaluate("""() => {
                 const els = document.querySelectorAll(
@@ -403,7 +496,6 @@ class AgentThread(QThread):
     # ── 动作解析 ──
 
     def _parse_action(self, response: str):
-        """从 LLM 回复中解析 JSON 动作"""
         m = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
         if m:
             try:
@@ -430,7 +522,6 @@ class AgentThread(QThread):
     # ── 动作执行 ──
 
     def _execute_action(self, page, action: dict):
-        """执行一个浏览器动作"""
         if self._stop_task_flag:
             return
 
