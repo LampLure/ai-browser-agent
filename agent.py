@@ -143,6 +143,19 @@ class AgentThread(QThread):
                     self.agent_done.emit()
                     continue
 
+                # 提示用户 AI 识别到的当前标签页
+                try:
+                    pages = context.pages
+                    if len(pages) > 1:
+                        for i, p in enumerate(pages):
+                            if p is active_page:
+                                tab_title = p.title() or "空白页"
+                                self.message.emit("system",
+                                    f"检测到当前标签: 标签{i} - {tab_title[:50]}")
+                                break
+                except:
+                    pass
+
                 self._run_agent_loop(active_page, context, llm, history, cmd["task"])
                 history.clear()
                 if self._stop_task_flag:
@@ -176,14 +189,30 @@ class AgentThread(QThread):
     def _get_active_page(self, context):
         """
         获取用户当前正在看的标签页。
-        策略：遍历所有标签页，找到 document.hasFocus() 为 true 的。
-        如果都找不到（用户可能焦点在别的应用），用最后一个标签页。
+        优先使用 document.visibilityState（不依赖浏览器窗口是否获得系统焦点），
+        其次用 document.hasFocus()，最后回退到最后一个标签页。
+
+        注意：document.hasFocus() 要求浏览器窗口本身有系统焦点，
+        当用户在 PyQt5 窗口输入时浏览器没有焦点，所有标签页都返回 false。
+        而 document.visibilityState === "visible" 只需要该标签页是浏览器
+        中当前显示的那个，不受系统焦点影响。
         """
         try:
             pages = context.pages
             if not pages:
                 return None
 
+            # 优先1: 用 visibilityState 找当前显示的标签页
+            # 这个属性在浏览器窗口没有系统焦点时仍然正确返回 "visible"
+            for page in pages:
+                try:
+                    visibility = page.evaluate("document.visibilityState")
+                    if visibility == "visible":
+                        return page
+                except:
+                    continue
+
+            # 优先2: 用 hasFocus 找有焦点的标签页（浏览器窗口有系统焦点时）
             for page in pages:
                 try:
                     has_focus = page.evaluate("document.hasFocus()")
@@ -192,7 +221,7 @@ class AgentThread(QThread):
                 except:
                     continue
 
-            # 回退：用最后一个标签页（通常是最新打开的）
+            # 回退: 用最后一个标签页（通常是最新打开的）
             return pages[-1]
         except:
             return None
